@@ -23,7 +23,7 @@ docker compose up --build
 - 交互式文档(Swagger UI):http://localhost:8000/docs
 - OpenAPI 描述:http://localhost:8000/openapi.json
 
-数据持久化在 Docker 卷 `sample-data`(容器内 `/data/samples.db`)。停止后数据保留,可用 `docker compose down -v` 连同数据卷一并清除。
+数据持久化在 Docker 卷 `sample-data`(容器内 `/data/samples.db`)。**容器内备份**持久化在独立 Docker 卷 `sample-backups`(容器内 `/backups`,见下文「数据库备份与复核」)。停止后数据与备份均保留,可用 `docker compose down -v` 连同数据卷一并清除。
 
 ### 本地直接运行(无 Docker)
 
@@ -33,7 +33,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 # 同样打开 http://localhost:8000
 ```
 
-可通过环境变量调整:`SAMPLE_DB_PATH`(数据库文件路径,默认 `./data/samples.db`)、`BALANCE_TOLERANCE`(余量校验容差,默认 `1e-6`)。
+可通过环境变量调整:`SAMPLE_DB_PATH`(数据库文件路径,默认 `./data/samples.db`)、`SAMPLE_BACKUP_DIR`(备份根目录,默认 `./backups`)、`BALANCE_TOLERANCE`(余量校验容差,默认 `1e-6`)。
 
 ## 数据模型与规则
 
@@ -1055,6 +1055,75 @@ curl -X POST http://localhost:8000/api/v1/screenings/independent-sources \
 
 > 以上接口服务均由 `docker compose up --build` 一键启动,依赖安装(构建期)与建表(容器入口)自动完成,服务监听 **http://localhost:8000**(见文首「一键启动」)。
 
+## 数据库备份与复核
+
+备份命令在**运行中的容器内**对 `/data/samples.db` 执行,使用 SQLite **online backup API** 分页拷贝一致性快照——不需要停服,**业务请求可同时写入**(拷贝期间源库被写入时,SQLite 会自动从已变更页重新拷贝,快照始终对应某一个已提交时刻)。每次备份:
+
+1. 在备份根目录(`/backups`,即命名卷 `sample-backups`)下创建**隐藏临时目录**;
+2. online backup API 生成数据库副本,并切换为 `delete` 日志模式,保证发布物是单个自包含 `.db` 文件(无 `-wal`/`-shm`/`-journal` 旁挂文件);
+3. 对副本执行 `PRAGMA integrity_check` 与 `PRAGMA foreign_key_check`;
+4. 校验通过后计算副本 **SHA-256**,写入 `backup_manifest.json`(含 **创建时间 `created_at`、哈希 `sha256`、数据库文件名 `database_file`**);
+5. 一次性 `rename` **原子发布**为唯一备份目录 `backup-<UTC时间戳>Z-<pid>-<随机串>/`。
+
+任一步骤失败都会删除整个临时目录,备份根目录下不会残留可能被误用的半成品,进程返回非 0 并输出错误 JSON。
+
+### 创建备份(容器内)
+
+```bash
+docker compose exec api python -m app.backup create
+```
+
+成功输出示例:
+
+```json
+{
+  "ok": true,
+  "backup_dir": "/backups/backup-20260925T134932Z-18-9a19215f6a6f",
+  "database_file": "samples.db",
+  "sha256": "f8eaa9ac7fefa0bbb192b3e54109d7c7ea34918fcb2c08c057400efe2fa65aa2",
+  "created_at": "2026-09-25T13:49:32.767616Z",
+  "integrity_check": ["ok"],
+  "foreign_key_check_violations": []
+}
+```
+
+每个备份目录内容固定为两份文件,数据库文件名与主库一致(恢复时直接取走即可):
+
+```
+/backups/backup-20260925T134932Z-18-9a19215f6a6f/
+  backup_manifest.json   # {"created_at", "database_file", "sha256"}
+  samples.db             # 自包含一致性快照
+```
+
+### 按清单复核备份
+
+复核命令按清单核对**文件齐备、SHA-256 与清单一致、`integrity_check` 返回 ok、`foreign_key_check` 无违例**(存在旁挂事务文件、清单被改、数据库文件名指向目录外等情况也判失败)。
+
+```bash
+# 复核指定备份目录
+docker compose exec api python -m app.backup verify /backups/backup-20260925T134932Z-18-9a19215f6a6f
+
+# 省略路径:复核备份根目录下最新一次备份
+docker compose exec api python -m app.backup verify
+
+# 复核 /backups 下的全部备份
+docker compose exec api python -m app.backup verify --all
+```
+
+复核通过退出码为 `0` 并输出 `"ok": true`(含清单记录的 `expected_sha256` 与实算的 `actual_sha256`);任一检查不通过退出码为 `1` 并在 `problems` 中列出原因。
+
+### 备份存放位置与取出
+
+- **容器内路径**:`/backups`(由环境变量 `SAMPLE_BACKUP_DIR` 指定,`docker-compose.yml` 把命名卷 `sample-backups` 挂载到该路径);源库路径为 `/data/samples.db`(`SAMPLE_DB_PATH`)。
+- **宿主机持久化**:命名卷由 Docker 管理,容器重建/升级后备份仍在。查看卷位置:`docker volume inspect sample-lineage_sample-backups`(实际名称以 compose 项目名为前缀)。
+- 把某次备份复制到宿主机当前目录:
+  ```bash
+  docker compose cp api:/backups/backup-20260925T134932Z-18-9a19215f6a6f ./backup-20260925
+  ```
+- 本地(非 Docker)运行时,备份默认写入仓库下 `backups/`(已在 `.gitignore` 忽略),同样用 `python -m app.backup create` 与 `python -m app.backup verify`,可用 `SAMPLE_BACKUP_DIR` / `SAMPLE_DB_PATH` 覆盖路径,或用 `--backup-dir` / `--db` 参数指定。
+
+> 备份命令是只读访问运行中的主库(仅打开连接做 online copy),不会初始化或修改主库;备份副本与主库相互独立,发布目录一经写定不再改动。
+
 ## 冲突码
 
 | code | 含义 |
@@ -1117,8 +1186,9 @@ python -m pytest -q
 
 ```
 app/
-  config.py        # 数据库路径、容差等配置
+  config.py        # 数据库路径、备份目录、容差等配置
   init_db.py       # 命令行幂等建表/迁移(容器入口先于 API 启动执行)
+  backup.py        # 容器内在线备份(SQLite backup API 一致性快照,允许并发写入)与按清单复核(integrity_check/foreign_key_check/SHA-256):临时目录校验后原子发布唯一备份目录,失败清理;`python -m app.backup create|verify`
   db.py            # SQLite 连接 / 建表 / 增量迁移(WAL、外键、CHECK 约束、预留/核销/盘点/销毁/位置交接/冲正/条码换绑/冷链测温/召回表)
   schemas.py       # Pydantic 请求与响应模型(含冲突结构、预留、核销领用、盘点、销毁、位置交接与整单冲正、条码换绑、冷链测温、样品召回模型)
   service.py       # 核心:事务提交、余量/可用量/环路校验、销毁审计、幂等回放、dry-run、谱系回溯(BFS)、账本审计
@@ -1134,6 +1204,7 @@ app/
   main.py          # FastAPI 路由
 tests/
   test_api.py          # 操作链路端到端测试(TestClient)
+  test_backup.py       # 容器内备份:在线一致性快照(备份期间持续写入)、校验+SHA-256 清单+原子发布、失败清理不留半成品、复核(哈希篡改/缺文件/旁挂文件/非法清单)与 CLI 退出码
   test_disposals.py    # 销毁/报废:可用量校验、整单回滚、不可变审计、幂等、批量与 dry-run
   test_reservation_guards.py # 分装/合并预留锁定防护:可用量口径(余量-未核销锁定)、释放/核销后解锁、整操作不写谱系流水、批量与 dry-run 同口径整批回滚、重放原结果
   test_reservations.py # 预留模块端到端/并发/审计测试

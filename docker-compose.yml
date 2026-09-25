@@ -10,9 +10,12 @@ services:
       - "8000:8000"
     environment:
       SAMPLE_DB_PATH: /data/samples.db
+      # 备份根目录:备份/复核命令在容器内读写该路径(命名卷持久化)
+      SAMPLE_BACKUP_DIR: /backups
       BALANCE_TOLERANCE: "1e-6"
     volumes:
       - sample-data:/data
+      - sample-backups:/backups
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=2).status==200 else 1)"]
@@ -22,3 +25,4 @@ services:
 
 volumes:
   sample-data:
+  sample-backups:
