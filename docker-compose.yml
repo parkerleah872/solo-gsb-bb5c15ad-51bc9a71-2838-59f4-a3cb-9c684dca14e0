@@ -1,0 +1,24 @@
+services:
+  api:
+    build: .
+    # 始终构建本地镜像而非尝试拉取:`docker compose up --build`
+    # 自动完成依赖安装(构建期 pip install)与建表(入口 python -m app.init_db)
+    pull_policy: build
+    image: sample-lineage-api:latest
+    container_name: sample-lineage-api
+    ports:
+      - "8000:8000"
+    environment:
+      SAMPLE_DB_PATH: /data/samples.db
+      BALANCE_TOLERANCE: "1e-6"
+    volumes:
+      - sample-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=2).status==200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  sample-data:
