@@ -10,9 +10,13 @@ services:
       - "8000:8000"
     environment:
       SAMPLE_DB_PATH: /data/samples.db
+      # 在线备份(`python -m app.backup create|verify`)的持久化目录
+      SAMPLE_BACKUP_DIR: /backups
       BALANCE_TOLERANCE: "1e-6"
     volumes:
       - sample-data:/data
+      # 备份独立成卷:`docker compose up --build`/重建容器后备份保留
+      - sample-backups:/backups
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=2).status==200 else 1)"]
@@ -22,3 +26,4 @@ services:
 
 volumes:
   sample-data:
+  sample-backups:

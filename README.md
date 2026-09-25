@@ -25,6 +25,83 @@ docker compose up --build
 
 数据持久化在 Docker 卷 `sample-data`(容器内 `/data/samples.db`)。停止后数据保留,可用 `docker compose down -v` 连同数据卷一并清除。
 
+## 在线备份与复核(容器内)
+
+备份使用 **SQLite 在线 backup API**(`sqlite3` 分页备份)对**正在运行**的数据库生成一致性快照:复制以只读连接分页推进,页批之间让出锁、遇 BUSY/LOCKED 自动重试,因此备份期间业务请求可以继续正常读写,无需停服;快照取自复制过程中的某个已提交事务点,不会读到撕裂状态。
+
+### 创建备份
+
+```bash
+docker compose exec api python -m app.backup create
+```
+
+每次备份的流程:
+
+1. 在备份根目录下创建隐藏临时目录(`.staging-*`),用 SQLite backup API 把在线库分页复制为临时副本(复制期间允许并发写入);
+2. 对副本执行 `PRAGMA integrity_check` 与 `PRAGMA foreign_key_check`,任一不通过即判定失败;
+3. 全部通过后计算副本文件 **SHA-256**,并写入 `manifest.json` 清单(包含**创建时间 `created_at`、哈希 `sha256`、数据库文件名 `database_file`**,以及文件大小、校验结果与源库路径);
+4. 用一次**原子 rename** 把临时目录发布为唯一备份目录 `samples-<UTC时间戳>-<8位UUID>`(同文件系统内改名,要么整体可见要么不可见,UUID 保证多次备份互不冲突);
+5. **任一步失败都会彻底删除临时目录**,备份根目录下不会留下半成品或可被误用的"成品"(已发布的历史备份不受影响)。
+
+成功输出示例:
+
+```text
+[backup] 在线备份(SQLite backup API,允许并发写入): samples.db
+[backup] integrity_check: ok;foreign_key_check: 0 项违例
+[backup] SHA-256: fc2477d9e7a4b0b187ec64de645371f19bfe9d2d184ae7963646a2a79913478a
+[backup] 大小: 319488 字节;创建时间: 2026-09-25T22:36:43.450242Z
+[backup] 已原子发布: /backups/samples-20260925T223643Z-34a34cf5
+```
+
+每个备份目录是自包含的:
+
+```text
+/backups/samples-20260925T223643Z-34a34cf5/
+  samples.db       # 一致性数据库副本(DELETE 日志模式,无 -wal/-shm 旁车)
+  manifest.json    # 创建时间、SHA-256、数据库文件名、大小与校验结果
+```
+
+### 按清单复核备份
+
+复核会重新计算备份库的 SHA-256 并与清单比对,同时再独立跑一遍 `integrity_check` 与 `foreign_key_check`(只读打开,不修改备份):
+
+```bash
+# 复核最新一份备份(默认)
+docker compose exec api python -m app.backup verify
+
+# 复核备份根目录下的全部备份
+docker compose exec api python -m app.backup verify --all
+
+# 复核指定备份目录
+docker compose exec api python -m app.backup verify /backups/samples-20260925T223643Z-34a34cf5
+
+# 列出全部备份(新的在前)
+docker compose exec api python -m app.backup list
+```
+
+复核通过逐行打印 `OK` 及哈希;哈希不一致、文件缺失、完整性或外键检查不通过时打印 `FAIL` 与逐项原因,并以**非零退出码**结束(便于接入巡检脚本 / cron 告警)。示例:
+
+```text
+[verify] OK   /backups/samples-20260925T223643Z-34a34cf5  数据库=samples.db  创建时间=2026-09-25T22:36:43.450242Z  sha256=fc2477d9...
+```
+
+### 备份存放位置
+
+- **容器内**:备份根目录为 `/backups`,由 Compose 挂载到独立的持久化 Docker 卷 **`sample-backups`**(与数据卷 `sample-data` 分离;重建容器、`docker compose up --build` 后备份保留)。可用环境变量 `SAMPLE_BACKUP_DIR` 覆盖;源库路径由 `SAMPLE_DB_PATH` 决定(默认 `/data/samples.db`)。
+- **宿主机查看备份文件**:
+  ```bash
+  docker compose exec api ls -l /backups
+  # 或查看卷在宿主机上的挂载点
+  docker volume inspect "$(basename "$PWD")_sample-backups" --format '{{ .Mountpoint }}'
+  ```
+- 把备份复制到容器外归档:
+  ```bash
+  docker compose cp api:/backups ./backups-export
+  ```
+- 本地(无 Docker)直接运行时,备份默认写入仓库下 `backups/`(已在 `.gitignore` 中忽略),同样可用 `SAMPLE_BACKUP_DIR` 环境变量或 `--backup-dir` 参数指定位置;源库可用 `--db` 指定。
+
+恢复时可用 `sqlite3 目标库 ".restore 备份文件"`,或直接以备份库作为数据源启动;恢复前建议先停止写入或再做一次当前库备份。
+
 ### 本地直接运行(无 Docker)
 
 ```bash
@@ -33,7 +110,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 # 同样打开 http://localhost:8000
 ```
 
-可通过环境变量调整:`SAMPLE_DB_PATH`(数据库文件路径,默认 `./data/samples.db`)、`BALANCE_TOLERANCE`(余量校验容差,默认 `1e-6`)。
+可通过环境变量调整:`SAMPLE_DB_PATH`(数据库文件路径,默认 `./data/samples.db`)、`SAMPLE_BACKUP_DIR`(备份根目录,默认 `./backups`)、`BALANCE_TOLERANCE`(余量校验容差,默认 `1e-6`)。备份命令见上一节(本地用 `python -m app.backup create|verify|list`)。
 
 ## 数据模型与规则
 
@@ -1117,8 +1194,9 @@ python -m pytest -q
 
 ```
 app/
-  config.py        # 数据库路径、容差等配置
+  config.py        # 数据库路径、备份目录、容差等配置
   init_db.py       # 命令行幂等建表/迁移(容器入口先于 API 启动执行)
+  backup.py        # 在线备份与按清单复核:SQLite backup API 分页快照(允许并发写入)→ integrity_check/foreign_key_check → SHA-256 与 manifest.json → 临时目录原子发布(失败清理);`python -m app.backup create|verify|list`
   db.py            # SQLite 连接 / 建表 / 增量迁移(WAL、外键、CHECK 约束、预留/核销/盘点/销毁/位置交接/冲正/条码换绑/冷链测温/召回表)
   schemas.py       # Pydantic 请求与响应模型(含冲突结构、预留、核销领用、盘点、销毁、位置交接与整单冲正、条码换绑、冷链测温、样品召回模型)
   service.py       # 核心:事务提交、余量/可用量/环路校验、销毁审计、幂等回放、dry-run、谱系回溯(BFS)、账本审计
@@ -1134,6 +1212,7 @@ app/
   main.py          # FastAPI 路由
 tests/
   test_api.py          # 操作链路端到端测试(TestClient)
+  test_backup.py       # 在线备份:并发写入下一致性快照、双校验门禁、SHA-256 与 manifest、原子发布/唯一目录、失败清理临时目录、篡改与路径逃逸复核、CLI 退出码
   test_disposals.py    # 销毁/报废:可用量校验、整单回滚、不可变审计、幂等、批量与 dry-run
   test_reservation_guards.py # 分装/合并预留锁定防护:可用量口径(余量-未核销锁定)、释放/核销后解锁、整操作不写谱系流水、批量与 dry-run 同口径整批回滚、重放原结果
   test_reservations.py # 预留模块端到端/并发/审计测试

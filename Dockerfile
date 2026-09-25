@@ -14,13 +14,13 @@ COPY app ./app
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
-# 非 root 运行,数据库目录显式授权
+# 非 root 运行,数据库目录与备份目录显式授权
 RUN useradd --create-home --uid 10001 appuser \
-    && mkdir -p /data \
-    && chown -R appuser:appuser /data
+    && mkdir -p /data /backups \
+    && chown -R appuser:appuser /data /backups
 USER appuser
 
-VOLUME ["/data"]
+VOLUME ["/data", "/backups"]
 
 EXPOSE 8000
 
